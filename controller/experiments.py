@@ -24,7 +24,7 @@ from __future__ import annotations
 import math
 
 from . import settings
-from .context import EXPERIMENT_DIMS, WorkflowCtx, dist_of, norm
+from .context import WorkflowCtx, dist_of, norm
 from .stats import Diff, stratified_diff, z_crit
 
 DECAY_WINDOW_ABS_H = 48

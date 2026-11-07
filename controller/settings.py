@@ -32,7 +32,6 @@ EXPLORE_SHARE = 0.10              # first exposure of an untested arm: a 10%-wor
 RAMP_SHARE = 0.25                 # a promising arm
 MAX_CHALLENGER_TOTAL = 0.55       # control always keeps ≥45% while exploring
 HOLDBACK = 0.15                   # after promotion the old control keeps 15%: needed to detect decay
-DECAY_WINDOW_HOURS = 24           # dialling hours (≈2 days) in the rolling decay window
 DECAY_MIN_AGE_HOURS = 6           # don't judge a promotion in its first 6 dialling hours
 DECAY_DIFF_Z = 2.58               # lift fell vs lift-at-promotion, p<0.005 (checked every 2h: overlapping looks)
 DECAY_NEG_Z = -2.33               # or lift is now negative, p<0.01
