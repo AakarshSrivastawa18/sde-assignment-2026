@@ -304,3 +304,19 @@ def test_ingest_crash_mid_chunk_leaves_nothing_behind(tmp_path):
         Ingestor(store, src, FeatureCodec(store)).ingest_available()
     assert store.q1("SELECT COUNT(*) FROM agg_kpi") == 0
     assert store.meta("last_chunk", -1) == -1
+
+
+# ---------------------------------------------------------------- supervisor edits are never auto-overwritten
+def test_supervisor_edited_dim_is_approval_only(tmp_path):
+    from controller.planner import auto_dims_allowed
+
+    class PolicyCtx:
+        id = "wf"
+
+        def auto_dims(self):
+            return {"schedule", "caller_id", "welcome_message", "voice", "cohorts"}
+
+    store = _store(tmp_path)
+    assert auto_dims_allowed(PolicyCtx(), store) == {"schedule", "caller_id", "welcome_message", "voice"}
+    store.set_kv("wf", "supervisor_touched", {"voice": 7500})
+    assert "voice" not in auto_dims_allowed(PolicyCtx(), store)   # long after the 24h pin, still approval-only

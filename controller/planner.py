@@ -30,6 +30,14 @@ from .experiments import expected_change
 log = logging.getLogger("controller.planner")
 
 
+def auto_dims_allowed(ctx: WorkflowCtx, store) -> set[str]:
+    """Dims we may change without a human: what the policy permits, never cohorts/prompt, and never a dim a client
+    supervisor has edited. After the 24h pin a supervisor-edited dim can change again, but only through /approvals,
+    so a person sees it — we never overwrite a supervisor's edit silently, even where auto-apply would allow it."""
+    touched = set(store.kv(ctx.id, "supervisor_touched") or {})
+    return (ctx.auto_dims() & {"schedule", "caller_id", "welcome_message", "voice"}) - touched
+
+
 def wf_values(store, codec, wf: str) -> dict[str, list[str]]:
     codes = [r[0] for r in store.q("SELECT DISTINCT fcode FROM agg_pick WHERE wf=? AND fcode>=0", (wf,))]
     out: dict[str, set] = {}
@@ -143,7 +151,7 @@ class Planner:
         dims = changed_dims(cur, target)
         if not dims:
             return True
-        auto_ok = ctx.auto_dims() & {"schedule", "caller_id", "welcome_message", "voice"}
+        auto_ok = auto_dims_allowed(ctx, self.store)
         approval_dims = [d for d in dims if d not in auto_ok]
         open_apr = self.gov.open_approval(wf)
         if approval_dims and not open_apr:
@@ -308,6 +316,9 @@ class Planner:
                   f" — expected {prim.replace('_rate', '')} {exp_primary:+.1%}"
         if self.pins(ctx.id, now):
             summary += f" (supervisor-edited dims left untouched: {sorted(self.pins(ctx.id, now))})"
+        touched = sorted(set(dims) & set(self.store.kv(ctx.id, "supervisor_touched") or {}))
+        if touched:
+            summary += f" — NOTE: changes {touched}, which a client supervisor edited earlier"
         request = {"change_summary": summary,
                    "diff": {d: {"from": _summ(cur, d), "to": _summ(target, d)} for d in dims},
                    "affected_leads": affected, "dry_run": dry, "impact_score": round(impact, 3),

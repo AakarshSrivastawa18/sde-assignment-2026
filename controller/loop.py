@@ -136,14 +136,17 @@ class Controller:
 
     def _on_supervisor_edit(self, ctx: WorkflowCtx, ev: dict, minute: int):
         pins = self.store.kv(ctx.id, "pins") or {}
+        touched = self.store.kv(ctx.id, "supervisor_touched") or {}
         until = minute + settings.SUPERVISOR_PIN_HOURS * 60
         for d in ev["changed_dims"]:
             pins[d] = max(pins.get(d, 0), until)
+            touched[d] = minute  # approval-only from now on (never auto-applied over the supervisor)
         self.store.set_kv(ctx.id, "pins", pins)
+        self.store.set_kv(ctx.id, "supervisor_touched", touched)
         self.store.decide(ctx.id, "governance", "supervisor_edit",
                           f"supervisor changed {ev['changed_dims']} (v{ev['version']}); those dims are pinned until "
-                          f"{fmt(until)} — routine changes will not touch them, and open proposals built on the old "
-                          f"version will be re-proposed on the new one", {"event": ev, "pins": pins})
+                          f"{fmt(until)} — routine changes will not touch them; after that they change only through an "
+                          f"approval (never auto-applied); open proposals on the old version are re-proposed on the new one", {"event": ev, "pins": pins})
         for d in ev["changed_dims"]:
             if d in EXPERIMENT_DIMS:
                 experiments.on_supervisor_edit(ctx, self.store, d)
