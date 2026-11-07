@@ -17,7 +17,7 @@ import logging
 import resource
 import time
 
-from . import callerid, experiments, schedule, settings
+from . import callerid, experiments, guardrail, schedule, settings
 from .client import SimClient
 from .context import EXPERIMENT_DIMS, WorkflowCtx
 from .governance import Governance
@@ -166,6 +166,7 @@ class Controller:
             self.store.set_kv(wf, "did_desired", d)
             urgent |= d["urgent"]
             schedule.step(ctx, self.store, self.codec, now)
+            guardrail.check(ctx, self.store, now)
         self.incidents.detect(wf, now)
         self.incidents.step(wf, now)
         hod, mod = hour_of_day(now), now % 60

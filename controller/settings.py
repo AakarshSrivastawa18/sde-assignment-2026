@@ -22,7 +22,8 @@ HARM_DROP_Z = -2.33               # drop an arm whose lift is below 0 at p<0.01 
 HARM_MIN_N = 100
 SEVERE_HARM_Z = -3.0              # intraday (non-look) drops need stronger evidence
 FUTILITY_MIN_N = 600              # stop an arm whose 95% upper bound on lift is < MIN_LIFT_TO_PROMOTE
-RAMP_Z = 0.84                     # P(better) ≥ 0.8 → give the arm more traffic (allocation, not a verdict)
+RAMP_Z = 1.28                     # P(better) ≥ 0.9 → give the arm more traffic (allocation, not a verdict)
+RAMP_MIN_N = 200
 SEGMENT_MIN_SHARE = 0.08          # segments smaller than this share of connected calls are not tested
 SEGMENT_MIN_LIFT = 0.05           # a segment-level win must be at least this big to justify a new cohort
 
@@ -33,8 +34,11 @@ MAX_CHALLENGER_TOTAL = 0.55       # control always keeps ≥45% while exploring
 HOLDBACK = 0.15                   # after promotion the old control keeps 15%: needed to detect decay
 DECAY_WINDOW_HOURS = 24           # dialling hours (≈2 days) in the rolling decay window
 DECAY_MIN_AGE_HOURS = 6           # don't judge a promotion in its first 6 dialling hours
-DECAY_DIFF_Z = 2.33               # lift fell vs lift-at-promotion, p<0.01
-DECAY_NEG_Z = -1.64               # or lift is now negative, p<0.05 (rollback is cheap and safe)
+DECAY_DIFF_Z = 2.58               # lift fell vs lift-at-promotion, p<0.005 (checked every 2h: overlapping looks)
+DECAY_NEG_Z = -2.33               # or lift is now negative, p<0.01
+DECAY_MIN_CTL = 300               # holdback calls in the window before judging: 1 day of a 15% holdback is ~200
+                                  # calls and produced a false rollback of a real winner in testing
+STABILITY_MIN_N = 50              # per daily window, for the "effect still present in each of the last 2 days" check
 
 # ---- caller IDs -------------------------------------------------------------------------------
 DID_EXPLORE_SHARE = 0.08          # untested number gets 8%: a spam-flagged one costs ≤~1.5% pickup
@@ -43,6 +47,7 @@ DID_MIN_EXPECTED_PICKUPS = 30     # population, not anecdote: ≥30 expected con
 DID_BAD_RATIO = 0.75              # observed/expected pickup ≤ 0.75 ...
 DID_BAD_Z = -3.0                  # ... and significant at p≈0.001
 DID_HEALTHY_RATIO = 0.85
+DID_REPROBE_HOURS = 48           # an *overloaded* number is rested this long, then explored again
 DID_INCIDENT_WINDOW_H = 4         # absolute hours for the fast incident check
 DID_HEALTH_WINDOW_H = 48          # absolute hours for the health census
 AUTO_STEP_COOLDOWN_MIN = 30       # between consecutive auto-apply steps on one workflow
@@ -57,15 +62,25 @@ SCHED_MATERIAL_LOG_CHANGE = 0.25  # re-push a schedule only when some weight mov
 SCHED_FEATURE_P = 1e-4            # interaction (segment × hour) must be this significant to split
 
 # ---- hallucination incidents ------------------------------------------------------------------
-HALLUC_WINDOW_H = 3
+# Poisson CUSUM on QA flags per connected call, over hourly aggregates since the current prompt went live.
+# k=2.5, h=8 chosen by simulation (scripts/cusum_sizing.py): ≈0.3–0.5% false incidents per workflow per
+# 10-day run at 70–1300 connected/hour, median delay ≈3h for a 3.6× spike, ≈11–18h for a 2× creep.
+HALLUC_CUSUM_K = 2.5
+HALLUC_CUSUM_H = 8.0
+HALLUC_CUSUM_H_FRESH = 6.0        # a prompt live < 48h is untrusted: alarm sooner (~1h faster on a 3.6× spike).
+                                  # The extra false alarms (~4%/run) cost 3 credits each: confirmation catches them.
+HALLUC_FRESH_HOURS = 48
 HALLUC_MIN_CONNECTED = 150
-HALLUC_MIN_FLAGS = 8
-HALLUC_P = 1e-4                   # Poisson tail vs the workflow's reference flag rate
-HALLUC_RATIO = 2.0
-HALLUC_RESOLVED_RATIO = 1.5       # post-fix flag rate must be ≤1.5× reference, over ≥ HALLUC_MIN_CONNECTED
-VALIDATION_N = 300                # 3 credits; P(false fail) for a 1%-fail prompt at a 0.97 bar < 0.1%
-VALIDATION_MARGIN = 0.005
-INCIDENT_CREDIT_CAP = 18          # per incident: 1 LLM call + up to 5 validations
+VERIFY_MIN_CONNECTED = 300        # post-fix evidence before we call it resolved
+VERIFY_MAX_CONNECTED = 1000       # ... and the most we wait before deciding on the point estimate
+VERIFY_OK_P = 0.01                # resolved: flags not significantly above reference (Poisson tail > 1%)
+VERIFY_FAIL_P = 1e-3              # failed: significantly above (and ≥1.5× reference)
+HALLUC_RESOLVED_RATIO = 1.5
+VALIDATION_N_KNOWN = 300          # a prompt with clean real-call history: 3 credits, governance needs the run
+VALIDATION_N_UNKNOWN = 800        # never run here: 8 credits; n=300 cannot tell a 1% from a 2.75% failure rate
+VALIDATION_MARGIN_KNOWN = 0.005
+VALIDATION_MARGIN_UNKNOWN = 0.01
+INCIDENT_CREDIT_CAP = 30          # per incident: 1 LLM call + a known-good check + up to 3 unknown validations
 CREDIT_FLOOR_SHARE = 0.10         # never spend the last 10% of credits except to validate a known-good revert
 
 # ---- governance -------------------------------------------------------------------------------

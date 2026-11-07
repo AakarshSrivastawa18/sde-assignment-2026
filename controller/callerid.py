@@ -55,26 +55,46 @@ def step(ctx: WorkflowCtx, store, now: int) -> dict:
     h_now = now // 60
     cur = dist_of(ctx.config, "default", "caller_id") if ctx.config else {}
     urgent = False
+    for d, ev in st["evidence"].items():
+        if st["status"].get(d) == "bad" and (ev or {}).get("reason") == "overload" and \
+                now - ev["at"] >= settings.DID_REPROBE_HOURS * 60:
+            st["status"][d] = "unknown"
+            st.setdefault("since", {})[d] = now  # judge it only on calls made after the rest
+            store.decide(wf, "caller_id", "did_reprobe", f"{d} rested {settings.DID_REPROBE_HOURS}h after an "
+                         f"overload verdict; re-probing at {settings.DID_EXPLORE_SHARE:.0%}", {"did": d})
     # 1) fast incident check on numbers carrying traffic
     fast = measure(store, wf, h_now - settings.DID_INCIDENT_WINDOW_H, h_now)
     census = measure(store, wf, h_now - settings.DID_HEALTH_WINDOW_H, h_now)
+    for d, since in (st.get("since") or {}).items():
+        # a re-probed number's older calls (incl. campaigns still locked to an old config) are not evidence
+        if st["status"].get(d) == "unknown":
+            m = measure(store, wf, max(h_now - settings.DID_HEALTH_WINDOW_H, since // 60 + 1), h_now)
+            census[d] = m.get(d, {"expected": 0, "ratio": 1.0, "z": 0.0, "observed": 0, "dials": 0})
+            fast.pop(d, None)
     for src, d, m in [("fast", d, m) for d, m in fast.items()] + [("census", d, m) for d, m in census.items()]:
         old = st["status"].get(d, "unknown")
         if old == "bad" or m["expected"] < settings.DID_MIN_EXPECTED_PICKUPS:
             continue
         if m["ratio"] <= settings.DID_BAD_RATIO and m["z"] <= settings.DID_BAD_Z:
-            st["status"][d] = "bad"
-            st["evidence"][d] = {**m, "at": now}
             share = cur.get(d, 0)
+            peers = [w for k, w in cur.items() if k != d and w > 0]
+            # a number carrying far more volume than its peers degrades from load and recovers with rest;
+            # one that degrades at a fair share is flagged (spam-listed) and stays out
+            overload = bool(peers) and share >= 1.5 * (sum(peers) / len(peers))
+            st["status"][d] = "bad"
+            st["evidence"][d] = {**m, "at": now, "reason": "overload" if overload else "flagged", "share": share}
             urgent = urgent or share > 0
             store.decide(wf, "caller_id", "did_degraded",
                          f"{d} picks up at {m['ratio']:.0%} of peer numbers in the same hours "
-                         f"(O={m['observed']} vs E={m['expected']}, z={m['z']}); carrying {share:.0%} of dials",
-                         {"did": d, "measure": m, "share": share})
+                         f"(O={m['observed']} vs E={m['expected']}, z={m['z']}); carrying {share:.0%} of dials"
+                         + (" — likely load (it carried ≥1.5× its peers' share); re-probe in "
+                            f"{settings.DID_REPROBE_HOURS}h" if overload else " — treated as flagged"),
+                         {"did": d, "measure": m, "share": share, "reason": "overload" if overload else "flagged"})
             if share > 0:
-                store.alert("page" if share >= 0.25 else "ticket", wf, f"did_degraded_{d}",
-                            f"{wf}: caller ID {d} degraded (O/E {m['ratio']:.2f}, z {m['z']}); "
-                            f"controller is rotating it out — check the number's spam status with the carrier")
+                store.alert("page" if (share >= 0.25 and not overload) else "ticket", wf, f"did_degraded_{d}",
+                            f"{wf}: caller ID {d} degraded (O/E {m['ratio']:.2f}, z {m['z']}); controller is "
+                            f"rotating it out — " + ("rest it; it will be re-probed" if overload else
+                                                     "check the number's spam status with the carrier"))
         elif old == "unknown" and src == "census" and m["ratio"] >= settings.DID_HEALTHY_RATIO:
             st["status"][d] = "healthy"
             st["evidence"][d] = {**m, "at": now}
@@ -85,9 +105,9 @@ def step(ctx: WorkflowCtx, store, now: int) -> dict:
     healthy = [d for d in ctx.options("caller_id") if st["status"].get(d) == "healthy"]
     unknown = [d for d in ctx.options("caller_id") if st["status"].get(d) == "unknown"]
     if not healthy:
-        # nothing measured yet (e.g. a single number in history): keep live numbers that are not bad,
-        # and explore unknowns next to them
-        healthy = [d for d in cur if st["status"].get(d) != "bad"]
+        # nothing measured yet (e.g. a single number in history): the incumbents — numbers carrying real
+        # volume, not ones we are merely exploring — stay live; unknowns are explored next to them
+        healthy = [d for d, w in cur.items() if w > settings.DID_EXPLORE_SHARE + 1e-6 and st["status"].get(d) != "bad"]
         unknown = [d for d in unknown if d not in healthy]
     if not healthy:
         return {"dist": cur, "urgent": urgent, "status": st["status"]}
@@ -97,7 +117,7 @@ def step(ctx: WorkflowCtx, store, now: int) -> dict:
     for d in healthy:
         dist[d] = rest / len(healthy)
     return {"dist": norm(dist), "urgent": urgent, "status": st["status"],
-            "evidence": {d: st["evidence"].get(d) for d in dist}}
+            "evidence": {d: (st["evidence"].get(d) if st["status"].get(d) != "unknown" else None) for d in dist}}
 
 
 def expected_pickup_change(cur: dict, new: dict, status_evidence: dict) -> float:

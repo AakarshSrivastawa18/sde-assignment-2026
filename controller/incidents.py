@@ -1,10 +1,15 @@
 """Hallucination incident response (C8): detect → pick a fix → validate → propose with evidence → verify.
 
-Detection (populations only): over the last HALLUC_WINDOW_H hours, and separately since the current prompt
-went live, the number of QA hallucination flags on connected calls is compared with the workflow's reference
-flag rate (pre-D0 history). We open an incident only if ≥ HALLUC_MIN_CONNECTED connected calls,
-≥ HALLUC_MIN_FLAGS flags, a Poisson tail p < HALLUC_P and the rate is ≥ HALLUC_RATIO × reference. The QA
-detector itself has false positives and negatives; the reference rate absorbs its FP floor.
+Detection (populations only, built for continuous monitoring): a Poisson CUSUM on QA hallucination flags per
+connected call, hourly, since the current prompt went live (or the last incident closed). It accumulates
+evidence for "rate = k × reference" and alarms at h; k and h were sized by simulation for ≈0.3–0.5% false
+incidents per workflow per 10-day run (scripts/cusum_sizing.py). A one-shot p-value re-tested every 15
+minutes would not control that — our first version used p<1e-4 per look and raised a false incident on a
+clean scenario. The QA detector has its own false positives; the reference rate (pre-D0 history) absorbs them.
+
+Confirmation: before anything changes we validate the LIVE prompt (3 credits). If it validates clean, a prompt
+switch cannot fix the spike, so we alert a human and change nothing (this prevented a false incident from
+shipping the "Strict" script on a clean workflow).
 
 Choosing a fix, cheapest evidence first ("the best compute is no compute"):
   1. A prompt this workflow has already run with a normal flag rate (usually the one the incident replaced).
@@ -15,17 +20,20 @@ Choosing a fix, cheapest evidence first ("the best compute is no compute"):
 The change is always a prompt change, so it always goes to a named human through /approvals — even when it
 reverts a supervisor's own edit. That is not "undoing it behind their back": the request carries the evidence.
 
-Verification: after the fix is live, ≥ HALLUC_MIN_CONNECTED connected calls on it must show a flag rate
-≤ HALLUC_RESOLVED_RATIO × reference; engagement is checked too. Otherwise the prompt is marked bad and we
-try the next candidate.
+Verification: after the fix is live we collect ≥ VERIFY_MIN_CONNECTED calls; resolved if flags are not
+significantly above reference (Poisson tail > 1%), failed if significantly above and ≥1.5× reference,
+otherwise keep collecting up to VERIFY_MAX_CONNECTED. Engagement is checked against pre-incident calls.
+Unknown prompts are validated on n=800 (n=300 cannot separate a 1% from a 2.75% failure rate).
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 
 from . import settings
 from .client import SimError
+from .simtime import fmt
 from .stats import poisson_sf, stratified_diff
 
 log = logging.getLogger("controller.incidents")
@@ -39,7 +47,8 @@ def reference_rate(store, wf: str) -> float:
                           (wf,))[0]
     if conn < 500:
         conn, flags = store.q("SELECT COALESCE(SUM(conn),0), COALESCE(SUM(flags),0) FROM agg_kpi WHERE h<0")[0]
-    rate = max(flags / conn if conn else 0.015, 0.002)
+    # upper 95% bound: an under-estimated reference makes the CUSUM drift upward and raise false incidents
+    rate = max((flags + 1.645 * math.sqrt(max(flags, 1))) / conn if conn else 0.015, 0.002)
     store.set_kv(wf, "halluc_ref", rate)
     return rate
 
@@ -55,10 +64,33 @@ def window_stats(store, wf: str, pv: str, h_from: int, h_to: int | None = None) 
 
 
 def spike(conn: int, flags: int, ref: float) -> tuple[bool, float]:
-    if conn < settings.HALLUC_MIN_CONNECTED or flags < settings.HALLUC_MIN_FLAGS:
+    """One-shot test used for prompt *history* screening (not for live monitoring — that is the CUSUM)."""
+    if conn < settings.HALLUC_MIN_CONNECTED:
         return False, 1.0
     p = poisson_sf(flags, conn * ref)
-    return (p < settings.HALLUC_P and flags / conn >= settings.HALLUC_RATIO * ref), p
+    return (p < 1e-4 and flags / conn >= 2 * ref), p
+
+
+def cusum(store, wf: str, pv: str, h_from: int, ref: float) -> dict:
+    """Poisson CUSUM for a rate increase to k×ref: S_t = max(0, S_{t-1} + x·ln k − n·ref·(k−1)), hourly."""
+    k = settings.HALLUC_CUSUM_K
+    rows = store.q("SELECT h, SUM(conn), SUM(flags) FROM agg_kpi WHERE wf=? AND pv=? AND h>=? GROUP BY h ORDER BY h",
+                   (wf, pv, h_from))
+    S = peak = 0.0
+    n_tot = x_tot = 0
+    since_reset_n = since_reset_x = 0
+    for h, n, x in rows:
+        S = max(0.0, S + x * math.log(k) - n * ref * (k - 1))
+        n_tot += n
+        x_tot += x
+        if S == 0:
+            since_reset_n = since_reset_x = 0
+        else:
+            since_reset_n += n
+            since_reset_x += x
+        peak = max(peak, S)
+    return {"S": round(S, 2), "peak": round(peak, 2), "connected": n_tot, "flags": x_tot,
+            "run_connected": since_reset_n, "run_flags": since_reset_x}
 
 
 def prompt_since_minute(store, wf: str, pv: str) -> int | None:
@@ -94,7 +126,7 @@ class IncidentResponder:
 
     def open_incident(self, wf: str) -> dict | None:
         r = self.store.q("SELECT id, status, detail, opened_minute FROM incidents WHERE wf=? AND kind='hallucination' "
-                         "AND status NOT IN ('resolved','abandoned') ORDER BY opened_minute DESC LIMIT 1", (wf,))
+                         "AND status NOT IN ('resolved','abandoned','unconfirmed') ORDER BY opened_minute DESC LIMIT 1", (wf,))
         if not r:
             return None
         return {"id": r[0][0], "status": r[0][1], "detail": json.loads(r[0][2]), "opened_minute": r[0][3]}
@@ -112,31 +144,32 @@ class IncidentResponder:
             return
         pv = ctx.config["prompt_version"]
         ref = reference_rate(self.store, wf)
-        h = now // 60
-        windows = {"recent": h - settings.HALLUC_WINDOW_H}
         since = prompt_since_minute(self.store, wf, pv)
-        if since is not None and since >= 0:
-            windows["since_prompt_live"] = since // 60
-        for name, h_from in windows.items():
-            conn, flags, _ = window_stats(self.store, wf, pv, h_from)
-            hit, p = spike(conn, flags, ref)
-            if hit:
-                iid = f"{wf}.halluc.m{now}"
-                detail = {"prompt": pv, "window": name, "connected": conn, "flags": flags,
-                          "flag_rate": round(flags / conn, 4), "reference_rate": round(ref, 4), "p_value": p,
-                          "tried": [], "validations": [], "bad_prompts": [pv], "credits_spent": 0,
-                          "proposal_id": None, "candidate": None}
-                with self.store.tx():
-                    self.store.db.execute("INSERT INTO incidents(id,wf,kind,status,opened_minute,detail) "
-                                          "VALUES(?,?,?,?,?,?)", (iid, wf, "hallucination", "open", now,
-                                                                  json.dumps(detail)))
-                    self.store.decide(wf, "incident", "hallucination_detected",
-                                      f"prompt {pv}: {flags}/{conn} connected calls flagged ({flags / conn:.1%}) vs "
-                                      f"reference {ref:.1%} (p={p:.1e}, window={name})", detail)
-                    self.store.alert("ticket", wf, "hallucination_incident",
-                                     f"{wf}: hallucination flags {flags / conn:.1%} vs {ref:.1%} on prompt {pv}; "
-                                     f"controller is preparing a validated fix for approval")
-                return
+        last_closed = self.store.q1("SELECT MAX(closed_minute) FROM incidents WHERE wf=?", (wf,))
+        start_min = max(m for m in (since, last_closed, 0) if m is not None)
+        c = cusum(self.store, wf, pv, start_min // 60, ref)
+        fresh = since is not None and since >= 0 and now - since < settings.HALLUC_FRESH_HOURS * 60
+        h_alarm = settings.HALLUC_CUSUM_H_FRESH if fresh else settings.HALLUC_CUSUM_H
+        if c["peak"] < h_alarm or c["run_connected"] < settings.HALLUC_MIN_CONNECTED:
+            return
+        conn, flags = c["run_connected"], c["run_flags"]
+        p = poisson_sf(flags, conn * ref)
+        iid = f"{wf}.halluc.m{now}"
+        detail = {"prompt": pv, "window": f"CUSUM run since {fmt(start_min)}", "connected": conn, "flags": flags,
+                  "flag_rate": round(flags / conn, 4), "reference_rate": round(ref, 4), "p_value": p,
+                  "cusum": c, "tried": [], "validations": [], "bad_prompts": [pv], "credits_spent": 0,
+                  "proposal_id": None, "candidate": None}
+        with self.store.tx():
+            self.store.db.execute("INSERT INTO incidents(id,wf,kind,status,opened_minute,detail) VALUES(?,?,?,?,?,?)",
+                                  (iid, wf, "hallucination", "open", now, json.dumps(detail)))
+            self.store.decide(wf, "incident", "hallucination_detected",
+                              f"prompt {pv}: {flags}/{conn} connected calls flagged ({flags / conn:.1%}) vs reference "
+                              f"{ref:.1%} — CUSUM {c['peak']:.1f} ≥ {h_alarm} (k={settings.HALLUC_CUSUM_K}"
+                              f"{', fresh prompt' if fresh else ''})",
+                              detail)
+            self.store.alert("ticket", wf, "hallucination_incident",
+                             f"{wf}: hallucination flags {flags / conn:.1%} vs {ref:.1%} on prompt {pv}; "
+                             f"controller is preparing a validated fix for approval")
 
     # ------------------------------------------------------------------ response
     def step(self, wf: str, now: int):
@@ -157,7 +190,9 @@ class IncidentResponder:
                 self.store.decide(wf, "incident", "fix_live", f"prompt is now {cur}; verifying on live calls",
                                   {"incident": inc["id"]})
             return
-        if st == "open":
+        if st == "open" and not d.get("confirmed"):
+            self._confirm(inc, ctx, now)
+        elif st == "open":
             self._choose_fix(inc, ctx, now, ref)
         elif st == "proposing":
             self._propose(inc, ctx, now)
@@ -187,7 +222,7 @@ class IncidentResponder:
         return True
 
     def _validate(self, inc: dict, ctx, pv: str, essential: bool) -> dict | None:
-        n = settings.VALIDATION_N
+        n = settings.VALIDATION_N_KNOWN if essential else settings.VALIDATION_N_UNKNOWN
         cost = -(-n // 100)
         if not self._can_spend(inc, cost, essential):
             return None
@@ -205,9 +240,40 @@ class IncidentResponder:
                           {"incident": inc["id"], "run": r})
         return r
 
+    def _confirm(self, inc: dict, ctx, now: int):
+        """3 credits to avoid a harmful change: if the live prompt validates clean, a prompt switch cannot fix the
+        spike (it is noise, the QA detector, or something outside the prompt) — alert a human, change nothing."""
+        d = inc["detail"]
+        with self.store.tx():
+            r = self._validate(inc, ctx, d["prompt"], essential=True)
+            if r is None:
+                d["confirmed"] = True  # cannot afford to check: proceed on the live evidence alone
+                d["confirmation"] = "skipped (credits)"
+                self._save(inc)
+                return
+            bar = float(ctx.gov.get("min_validation_pass_rate", 0.97))
+            if r["pass_rate"] >= bar + settings.VALIDATION_MARGIN_KNOWN:
+                d["confirmation"] = r
+                self._save(inc, "unconfirmed", closed=now)
+                self.store.decide(ctx.id, "incident", "incident_unconfirmed",
+                                  f"live flags on {d['prompt']} are elevated but the prompt validates clean "
+                                  f"({r['pass_rate']:.3f}); no prompt change — monitoring restarts",
+                                  {"incident": inc["id"], "run": r})
+                self.store.alert("ticket", ctx.id, "hallucination_unconfirmed",
+                                 f"{ctx.id}: QA flags rose to {d['flag_rate']:.1%} but prompt {d['prompt']} validates "
+                                 f"clean — check the QA detector / call samples")
+                return
+            d["confirmed"] = True
+            d["confirmation"] = r
+            self._save(inc)
+            self.store.decide(ctx.id, "incident", "incident_confirmed",
+                              f"{d['prompt']} fails validation ({r['pass_rate']:.3f} < {bar + settings.VALIDATION_MARGIN_KNOWN:.3f}): "
+                              f"confirmed, choosing a fix", {"incident": inc["id"], "run": r})
+        self._choose_fix(inc, ctx, now, reference_rate(self.store, ctx.id))
+
     def _choose_fix(self, inc: dict, ctx, now: int, ref: float):
         d = inc["detail"]
-        need = float(ctx.gov.get("min_validation_pass_rate", 0.97)) + settings.VALIDATION_MARGIN
+        bar = float(ctx.gov.get("min_validation_pass_rate", 0.97))
         tried = set(d["tried"]) | set(d["bad_prompts"])
         cands = [(pv, s, "known_good") for pv, s in known_good_prompts(self.store, ctx.id, ctx.config["prompt_version"], ref)
                  if pv not in tried]
@@ -235,6 +301,7 @@ class IncidentResponder:
                 r = self._validate(inc, ctx, pv, essential=(src == "known_good"))
                 if r is None:
                     break
+                need = bar + (settings.VALIDATION_MARGIN_KNOWN if src == "known_good" else settings.VALIDATION_MARGIN_UNKNOWN)
                 if r["pass_rate"] >= need:
                     d["candidate"] = pv
                     d["candidate_info"] = {"source": src, **info}
@@ -308,12 +375,18 @@ class IncidentResponder:
         d = inc["detail"]
         pv = ctx.config["prompt_version"]
         conn, flags, eng = window_stats(self.store, ctx.id, pv, d["fix_live_minute"] // 60 + 1)
-        if conn < settings.HALLUC_MIN_CONNECTED:
+        if conn < settings.VERIFY_MIN_CONNECTED:
             return
         rate = flags / conn
-        bad, p = spike(conn, flags, ref)
+        p = poisson_sf(flags, conn * ref)
+        failed = p < settings.VERIFY_FAIL_P and rate >= settings.HALLUC_RESOLVED_RATIO * ref
+        ok = p > settings.VERIFY_OK_P
+        if not failed and not ok:
+            if conn < settings.VERIFY_MAX_CONNECTED:
+                return  # inconclusive: keep collecting
+            failed = rate > settings.HALLUC_RESOLVED_RATIO * ref
         with self.store.tx():
-            if bad or rate > settings.HALLUC_RESOLVED_RATIO * ref:
+            if failed:
                 d["bad_prompts"].append(pv)
                 self._save(inc, "open")
                 self.store.decide(ctx.id, "incident", "fix_failed_verification",

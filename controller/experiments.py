@@ -6,7 +6,7 @@ Design (SUBMISSION.md §5 has the reasoning and the numbers):
   * Metric: engagement = engaged / connected. Only calls that actually happened count — an arm whose
     approval never came simply has no calls and no evidence.
   * Estimator: stratified (day × config_version × prompt) difference vs the segment's control arm.
-  * Exploration: an untested arm gets EXPLORE_SHARE; a promising one (P(better) ≥ 0.8) gets RAMP_SHARE.
+  * Exploration: an untested arm gets EXPLORE_SHARE; a promising one (P(better) ≥ 0.9) gets RAMP_SHARE.
     Ramping is an allocation choice, not a verdict.
   * Verdict (deterministic): once a day, at a fixed look time. An arm wins if n ≥ MIN_CONNECTED_PER_ARM, its
     lift ≥ MIN_LIFT_TO_PROMOTE and z ≥ z_crit, where z_crit is Bonferroni over the arms compared and
@@ -50,6 +50,15 @@ class ArmData:
         self.rows = store.q(
             f"SELECT h/24, cv, pv, fcode, {col}, SUM(conn), SUM(eng) FROM agg_eng WHERE wf=? AND h>=? "
             f"GROUP BY h/24, cv, pv, fcode, {col}", (wf, h_from))
+
+    @staticmethod
+    def window(store, wf: str, dim: str, h_from: int, h_to: int) -> "ArmData":
+        col = "wm" if dim == "welcome_message" else "vo"
+        a = ArmData.__new__(ArmData)
+        a.rows = store.q(
+            f"SELECT h/24, cv, pv, fcode, {col}, SUM(conn), SUM(eng) FROM agg_eng WHERE wf=? AND h>=? AND h<? "
+            f"GROUP BY h/24, cv, pv, fcode, {col}", (wf, h_from, h_to))
+        return a
 
     def diff(self, arm: str, ctl: str, fcodes: set[int] | None = None) -> Diff | None:
         acc: dict[tuple, list[int]] = {}
@@ -107,6 +116,12 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
     st = store.kv(wf, f"exp:{dim}") or init_state(ctx, dim)
     start_h = st.setdefault("start_h", now // 60)
     data = ArmData(store, wf, dim, start_h)
+    # a decaying arm hides behind its good early days in cumulative data: also judge the recent window
+    recent = ArmData(store, wf, dim, max(start_h, now // 60 - DECAY_WINDOW_ABS_H))
+    # promotion stability: the effect must still be there over the last day (holding costs a day; promoting a
+    # fading variant harms everyone it reaches)
+    days = [ArmData.window(store, wf, dim, max(start_h, now // 60 - 24 * (i + 1)), now // 60 - 24 * i)
+            for i in range(2)]
     changed = urgent = False
     for key, seg in st["segs"].items():
         codes = seg_codes(codec, st["partition"], key)
@@ -116,17 +131,25 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
             zc = z_crit(len(live), settings.FAMILY_ALPHA, settings.POCOCK_FACTOR)
             res = {a: data.diff(a, seg["control"], codes) for a in live}
             winners = []
+            harm_z = settings.SEVERE_HARM_Z if intraday else settings.HARM_DROP_Z
             for a, d in res.items():
                 if d is None:
                     continue
-                if d.n_arm >= settings.HARM_MIN_N and d.z <= (settings.SEVERE_HARM_Z if intraday else settings.HARM_DROP_Z):
+                dr = recent.diff(a, seg["control"], codes)
+                for which, x in (("cumulative", d), ("last 48h", dr)):
+                    if x is not None and x.n_arm >= settings.HARM_MIN_N and x.z <= harm_z:
+                        break
+                else:
+                    x = None
+                if x is not None:
                     seg["arms"][a] = "dropped"
                     changed = True
                     urgent = urgent or intraday
                     store.decide(wf, "experiment", "arm_dropped_harm",
-                                 f"{label}: {a} is worse than {seg['control']} (lift {d.lift:+.1%}, z={d.z:.2f}, "
-                                 f"n={d.n_arm}); stop exposing customers to it", {"dim": dim, "seg": key, "arm": a,
-                                                                                  "stats": d.as_dict()})
+                                 f"{label}: {a} is worse than {seg['control']} ({which}: lift {x.lift:+.1%}, "
+                                 f"z={x.z:.2f}, n={x.n_arm}); stop exposing customers to it",
+                                 {"dim": dim, "seg": key, "arm": a, "window": which, "stats": x.as_dict(),
+                                  "cumulative": d.as_dict()})
                     continue
                 if intraday:
                     continue
@@ -143,13 +166,29 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
                 if d.n_arm >= settings.MIN_CONNECTED_PER_ARM and d.z >= zc and d.lift >= settings.MIN_LIFT_TO_PROMOTE \
                         and lo > 0:
                     winners.append((lo, a, d))
-                elif seg["arms"][a] == "active" and d.n_arm >= settings.HARM_MIN_N and d.z >= settings.RAMP_Z:
+                elif seg["arms"][a] == "active" and d.n_arm >= settings.RAMP_MIN_N and d.z >= settings.RAMP_Z \
+                        and d.lift >= settings.MIN_LIFT_TO_PROMOTE:
                     seg["arms"][a] = "ramped"
                     changed = True
                     store.decide(wf, "experiment", "arm_ramped",
                                  f"{label}: {a} looks promising (lift {d.lift:+.1%}, z={d.z:.2f}, n={d.n_arm}); "
                                  f"more traffic to reach a verdict sooner — not a winner yet",
                                  {"dim": dim, "seg": key, "arm": a, "stats": d.as_dict()})
+            held = []
+            for w in sorted(winners, reverse=True):
+                lo, a, d = w
+                daily = [x.diff(a, seg["control"], codes) for x in days]
+                weak = [i for i, x in enumerate(daily) if x is not None and x.n_arm >= settings.STABILITY_MIN_N
+                        and x.lift < settings.MIN_LIFT_TO_PROMOTE / 2]
+                if weak:
+                    held.append(w)
+                    store.decide(wf, "experiment", "promotion_held",
+                                 f"{label}: {a} passes the cumulative test (lift {d.lift:+.1%}) but its lift was "
+                                 + ", ".join(f"{daily[i].lift:+.1%} {'in the last 24h' if i == 0 else '24–48h ago'}"
+                                             for i in weak) + " — a fading (novelty) effect is not promoted",
+                                 {"dim": dim, "seg": key, "arm": a, "cumulative": d.as_dict(),
+                                  "daily": [x.as_dict() if x else None for x in daily]})
+            winners = [w for w in winners if w not in held]
             if winners:
                 lo, a, d = max(winners)
                 seg.update(status="promoted", winner=a, promoted_h=now // 60,
@@ -191,7 +230,7 @@ def decay_check(store, wf: str, dim: str, seg: dict, codes, now: int) -> dict | 
         return None
     window = ArmData(store, wf, dim, max(seg["promoted_h"], h_now - DECAY_WINDOW_ABS_H))
     d = window.diff(seg["winner"], seg["control"], codes)
-    if d is None or d.n_ctl < settings.HARM_MIN_N:
+    if d is None or d.n_ctl < settings.DECAY_MIN_CTL:
         return None
     p = seg["promo"]
     z_drop = (p["diff"] - d.diff) / math.sqrt(p["se"] ** 2 + d.se ** 2) if d.se > 0 else 0

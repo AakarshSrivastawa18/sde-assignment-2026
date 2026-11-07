@@ -116,6 +116,8 @@ class Planner:
                     cfg["allocations"].setdefault(c.id, {})["caller_id"] = explicit
         # schedule
         sched = self.store.kv(ctx.id, "schedule") or {}
+        if (self.store.kv(ctx.id, "schedule_suspended_until") or -10**9) > now:
+            sched = {}  # guardrail breach: our call-time weights are backed out
         if "schedule" in pins or not sched.get("feature"):
             live_ids = {c.id for c in cobjs} | {"default"}
             cfg["schedule"]["hour_weights"] = {k: v for k, v in cur.get("schedule", {}).get("hour_weights", {}).items()
@@ -233,7 +235,8 @@ class Planner:
         if "caller_id" in dims:
             st = self.store.kv(wf, "did") or {}
             a, b = dist_of(cur, "default", "caller_id"), dist_of(new, "default", "caller_id")
-            ch = callerid.expected_pickup_change(a, b, st.get("evidence", {}))
+            ev = {d: e for d, e in (st.get("evidence") or {}).items() if st.get("status", {}).get(d) != "unknown"}
+            ch = callerid.expected_pickup_change(a, b, ev)
             items.append({"dim": "caller_id", "summary": "caller IDs " + _fmt_dist(a) + " → " + _fmt_dist(b) +
                           f" (status {st.get('status')}; expected pickup {ch:+.1%})",
                           "expected": {"pickup_rate": ch}, "evidence": {"did_status": st.get("status"),
@@ -281,6 +284,9 @@ class Planner:
         impact = min(1.0, max(0.05, 10 * max(exp_primary, 0) + 2 * max(exp_other, 0)))
         if kind == "incident":
             impact = max(impact, 0.8)
+        if kind == "routine" and exp_primary < -0.005:
+            self._note_wait(ctx.id, f"not proposing {dims}: our own estimate of {prim} is {exp_primary:+.1%}")
+            return
         affected = self._affected(ctx, cur, target, dims, now)
         pop = self.store.q("SELECT fcode, SUM(conn) FROM agg_eng WHERE wf=? AND h>=? GROUP BY fcode",
                            (ctx.id, now // 60 - 7 * 24))
