@@ -143,6 +143,7 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
                     x = None
                 if x is not None:
                     seg["arms"][a] = "dropped"
+                    seg.setdefault("drop_reason", {})[a] = "harm"
                     changed = True
                     urgent = urgent or intraday
                     store.decide(wf, "experiment", "arm_dropped_harm",
@@ -167,7 +168,7 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
                         and lo > 0:
                     winners.append((lo, a, d))
                 elif seg["arms"][a] == "active" and d.n_arm >= settings.RAMP_MIN_N and d.z >= settings.RAMP_Z \
-                        and d.lift >= settings.MIN_LIFT_TO_PROMOTE:
+                        and d.lift >= settings.MIN_LIFT_TO_PROMOTE and _still_there(days[0], a, seg["control"], codes):
                     seg["arms"][a] = "ramped"
                     changed = True
                     store.decide(wf, "experiment", "arm_ramped",
@@ -178,8 +179,11 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
             for w in sorted(winners, reverse=True):
                 lo, a, d = w
                 daily = [x.diff(a, seg["control"], codes) for x in days]
+                # each of the last two days must show the effect, and the last day must keep at least half of the
+                # cumulative lift (a weak trend test: novelty effects fade within days)
+                floors = [max(settings.MIN_LIFT_TO_PROMOTE / 2, d.lift / 2), settings.MIN_LIFT_TO_PROMOTE / 2]
                 weak = [i for i, x in enumerate(daily) if x is not None and x.n_arm >= settings.STABILITY_MIN_N
-                        and x.lift < settings.MIN_LIFT_TO_PROMOTE / 2]
+                        and x.lift < floors[i]]
                 if weak:
                     held.append(w)
                     store.decide(wf, "experiment", "promotion_held",
@@ -206,6 +210,20 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
                 changed = True
                 store.decide(wf, "experiment", "experiment_concluded",
                              f"{label}: no arm beat {seg['control']}; keep {seg['control']}", {"dim": dim, "seg": key})
+        elif seg["status"] == "promoted" and not _live(ctx, st, key, seg, dim):
+            # decided but not yet applied (waiting for approval): the evidence must still hold when it ships
+            daily = [x.diff(seg["winner"], seg["control"], codes) for x in days]
+            weak = [x for x in daily if x is not None and x.n_arm >= settings.STABILITY_MIN_N
+                    and x.lift < settings.MIN_LIFT_TO_PROMOTE / 2]
+            if weak:
+                old = seg["winner"]
+                seg["arms"][old] = "ramped"
+                seg.update(status="exploring", winner=None, promoted_h=None, promo=None)
+                changed = True
+                store.decide(wf, "experiment", "promotion_withdrawn",
+                             f"{label}: {old} was promoted but is not live yet, and its daily lift is now "
+                             + ", ".join(f"{x.lift:+.1%}" for x in weak) + " — withdrawn before it ships",
+                             {"dim": dim, "seg": key, "arm": old, "daily": [x.as_dict() if x else None for x in daily]})
         elif seg["status"] == "promoted":
             r = decay_check(store, wf, dim, seg, codes, now)
             if r is not None:
@@ -219,9 +237,25 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
                              f"{label}: {old} stopped winning — {r['why']}; back to {seg['control']}",
                              {"dim": dim, "seg": key, "arm": old, **r})
     if not intraday and st["partition"] is None:
-        changed |= _maybe_split(ctx, store, codec, dim, st, data, now)
+        changed |= _maybe_split(ctx, store, codec, dim, st, data, recent, now)
     store.set_kv(wf, f"exp:{dim}", st)
     return {"changed": changed, "urgent": urgent}
+
+
+def _still_there(day: ArmData, arm: str, ctl: str, codes) -> bool:
+    """More exposure only if the effect is visible in the last 24h too (or there is too little data to say)."""
+    x = day.diff(arm, ctl, codes)
+    return x is None or x.n_arm < settings.STABILITY_MIN_N or x.lift >= settings.MIN_LIFT_TO_PROMOTE / 2
+
+
+def _live(ctx: WorkflowCtx, st: dict, key: str, seg: dict, dim: str) -> bool:
+    """Is this segment's promotion actually in the live config (winner carries the majority)?"""
+    cohort = "default"
+    if st["partition"] and key != "*":
+        cohort = next((c.id for c in ctx.live_cohorts() if c.value(st["partition"]) == key), None)
+        if cohort is None:
+            return False
+    return dist_of(ctx.config, cohort, dim).get(seg["winner"], 0) >= 0.5
 
 
 def decay_check(store, wf: str, dim: str, seg: dict, codes, now: int) -> dict | None:
@@ -242,7 +276,7 @@ def decay_check(store, wf: str, dim: str, seg: dict, codes, now: int) -> dict | 
     return None
 
 
-def _maybe_split(ctx, store, codec, dim: str, st: dict, data: ArmData, now: int) -> bool:
+def _maybe_split(ctx, store, codec, dim: str, st: dict, data: ArmData, recent: ArmData, now: int) -> bool:
     seg0 = st["segs"]["*"]
     if seg0["status"] == "done" and not any(s != "dropped" for s in seg0["arms"].values()):
         pass  # concluded globally; a segment effect can still exist — keep looking
@@ -256,7 +290,12 @@ def _maybe_split(ctx, store, codec, dim: str, st: dict, data: ArmData, now: int)
             if share < settings.SEGMENT_MIN_SHARE:
                 continue
             for a in ctx.options(dim):
-                if a == incumbent:
+                # never revive an arm we rolled back (decay) or dropped for harm via a segment
+                if a == incumbent or seg0["arms"].get(a) == "rolled_back" or \
+                        (seg0.get("drop_reason") or {}).get(a) == "harm":
+                    continue
+                dr = recent.diff(a, incumbent, codes)
+                if dr is not None and dr.n_arm >= settings.STABILITY_MIN_N and dr.lift < settings.MIN_LIFT_TO_PROMOTE / 2:
                     continue
                 d = data.diff(a, incumbent, codes)
                 if d is not None:
@@ -283,18 +322,21 @@ def _maybe_split(ctx, store, codec, dim: str, st: dict, data: ArmData, now: int)
             best = max(((d.diff - zc * d.se) / d.p_ctl, a, d) for ff, vv, a, _, d in sig if ff == f and vv == v) \
                 if any(ff == f and vv == v for ff, vv, *_ in sig) else None
             if best:
+                # a segment finding earns the segment more traffic, not an instant promotion: the winner must
+                # still pass the segment's own daily look (incl. the two-day stability check)
                 lo, a, d = best
-                s.update(status="promoted", winner=a, promoted_h=now // 60, control=incumbent,
-                         promo={"diff": d.diff, "se": d.se, "lift": d.lift})
-                s["arms"].setdefault(seg0["control"], "active")
-                s["arms"].pop(incumbent, None)
-                s["arms"][a] = s["arms"].get(a, "active")
+                s.update(status="exploring", winner=None, promoted_h=None, promo=None, control=incumbent)
+                s["arms"] = {o: st_ for o, st_ in s["arms"].items() if o != incumbent}
+                if seg0["control"] != incumbent:
+                    s["arms"].setdefault(seg0["control"], "active")
+                s["arms"][a] = "ramped"
             segs[v] = s
         st["partition"], st["segs"], st["pending_plan"] = f, segs, True
         store.decide(ctx.id, "experiment", "segment_split",
                      f"{dim}: effect differs by {f} — " + "; ".join(
                          f"{a} in {f}={v}: lift {d.lift:+.1%} (z={d.z:.2f}≥{zc:.2f}, n={d.n_arm})"
-                         for ff, v, a, _, d in sig if ff == f) + f"; split {dim} by {f} (new cohorts)",
+                         for ff, v, a, _, d in sig if ff == f) + f"; split {dim} by {f} (new cohorts) and ramp those "
+                     f"arms in their segment — promotion still needs the segment's own look",
                      {"dim": dim, "feature": f, "z_crit": zc, "tests": m,
                       "significant": [{"value": v, "arm": a, **d.as_dict()} for ff, v, a, _, d in sig if ff == f]})
         return True

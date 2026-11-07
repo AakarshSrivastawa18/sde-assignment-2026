@@ -7,6 +7,7 @@ State machine of a proposal (table `proposals`, column `status`):
           │                      │            │            ├─409 stale──▶ stale   (re-proposed on fresh base)
           │                      │            │            └─410───────▶ lapsed  (re-proposed)
           │                      │            └─(apply window passes)──▶ lapsed
+          │                      │            └─(our evidence turned since)──▶ superseded (not applied)
           │                      ├──▶ rejected   (back-off, then re-proposed with fresh data)
           │                      └──▶ expired    (treated as a rejection — Product memo)
           └─4xx──▶ failed
@@ -37,6 +38,18 @@ OPEN_APPROVAL = ("submitting", "pending", "approved", "applying")
 class Governance:
     def __init__(self, store, client, ctxs: dict):
         self.store, self.client, self.ctxs = store, client, ctxs
+
+    def superseded_by(self, p: dict) -> str | None:
+        """An approved proposal is not applied if, since it was written, our own evidence turned against a dim it
+        changes (a rollback or a harm-drop on that dim). Applying it would ship what we already know is wrong."""
+        dims = {i.get("dim") for i in (p.get("items") or [])}
+        rows = self.store.q("SELECT kind, summary, detail FROM decisions WHERE wf=? AND component='experiment' AND "
+                            "kind IN ('winner_rolled_back','arm_dropped_harm','promotion_withdrawn') AND minute>? ORDER BY id",
+                            (p["wf"], p["created_minute"]))
+        for kind, summary, detail in rows:
+            if json.loads(detail).get("dim") in dims:
+                return summary
+        return None
 
     # ------------------------------------------------------------------ queries
     def open_approval(self, wf: str) -> dict | None:
@@ -199,6 +212,15 @@ class Governance:
                                   {"approval": a}, proposal_id=pid)
             return self.get(pid)
         if st == "approved":
+            why = self.superseded_by(p) if p["status"] != "applying" else None
+            if why:
+                with self.store.tx():
+                    self._set(pid, status="superseded", decided_minute=dmin)
+                    self.store.decide(wf, "governance", "proposal_superseded",
+                                      f"{a['approval_id']} approved but NOT applied: evidence changed since it was "
+                                      f"written ({why}); a fresh proposal will follow", {"approval": a},
+                                      proposal_id=pid)
+                return self.get(pid)
             if p["status"] != "applying":
                 with self.store.tx():
                     self._set(pid, status="approved", decided_minute=dmin)

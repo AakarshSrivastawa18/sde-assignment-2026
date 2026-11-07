@@ -150,6 +150,10 @@ class IncidentResponder:
         c = cusum(self.store, wf, pv, start_min // 60, ref)
         fresh = since is not None and since >= 0 and now - since < settings.HALLUC_FRESH_HOURS * 60
         h_alarm = settings.HALLUC_CUSUM_H_FRESH if fresh else settings.HALLUC_CUSUM_H
+        if fresh:
+            pre = self._prevalidate(ctx, pv, ref)
+            if pre is not None and pre["pass_rate"] < float(ctx.gov.get("min_validation_pass_rate", 0.97)):
+                h_alarm = settings.HALLUC_CUSUM_H_PREVALIDATED_FAIL
         if c["peak"] < h_alarm or c["run_connected"] < settings.HALLUC_MIN_CONNECTED:
             return
         conn, flags = c["run_connected"], c["run_flags"]
@@ -170,6 +174,34 @@ class IncidentResponder:
             self.store.alert("ticket", wf, "hallucination_incident",
                              f"{wf}: hallucination flags {flags / conn:.1%} vs {ref:.1%} on prompt {pv}; "
                              f"controller is preparing a validated fix for approval")
+
+    def _prevalidate(self, ctx, pv: str, ref: float) -> dict | None:
+        """A prompt that went live here without clean history gets one validation run (3 credits) up front.
+        It never triggers a change by itself; it only lowers how much live evidence the CUSUM needs."""
+        key = f"prevalidation:{pv}"
+        done = self.store.kv(ctx.id, key)
+        if done is not None:
+            return done or None
+        if any(p == pv for p, _ in known_good_prompts(self.store, ctx.id, "", ref)):
+            self.store.set_kv(ctx.id, key, {})
+            return None
+        total = self.store.meta("credits_total") or 0
+        left = self._credits()
+        if left - 3 < settings.CREDIT_FLOOR_SHARE * total:
+            return None
+        try:
+            r = self.client.validate(ctx.id, pv, settings.VALIDATION_N_KNOWN)
+        except SimError:
+            return None
+        with self.store.tx():
+            self.store.set_kv(ctx.id, key, r)
+            self.store.decide(ctx.id, "incident", "prevalidation",
+                              f"new prompt {pv} has no clean history here: validation pass rate {r['pass_rate']:.3f} "
+                              f"(approver bar {ctx.gov.get('min_validation_pass_rate', 0.97)}); "
+                              + ("live monitoring tightened" if r["pass_rate"] < float(ctx.gov.get(
+                                  "min_validation_pass_rate", 0.97)) else "normal fresh-prompt monitoring"),
+                              {"run": r})
+        return r
 
     # ------------------------------------------------------------------ response
     def step(self, wf: str, now: int):
@@ -245,7 +277,11 @@ class IncidentResponder:
         spike (it is noise, the QA detector, or something outside the prompt) — alert a human, change nothing."""
         d = inc["detail"]
         with self.store.tx():
-            r = self._validate(inc, ctx, d["prompt"], essential=True)
+            r = self.store.kv(ctx.id, f"prevalidation:{d['prompt']}") or None
+            if r:
+                d["validations"].append(r)
+            else:
+                r = self._validate(inc, ctx, d["prompt"], essential=True)
             if r is None:
                 d["confirmed"] = True  # cannot afford to check: proceed on the live evidence alone
                 d["confirmation"] = "skipped (credits)"

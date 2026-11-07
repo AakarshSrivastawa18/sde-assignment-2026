@@ -70,6 +70,8 @@ HALLUC_CUSUM_H = 8.0
 HALLUC_CUSUM_H_FRESH = 6.0        # a prompt live < 48h is untrusted: alarm sooner (~1h faster on a 3.6× spike).
                                   # The extra false alarms (~4%/run) cost 3 credits each: confirmation catches them.
 HALLUC_FRESH_HOURS = 48
+HALLUC_CUSUM_H_PREVALIDATED_FAIL = 3.0  # a fresh prompt that already FAILED validation (the client's own approval
+                                        # bar) needs less live evidence; live flags are still required
 HALLUC_MIN_CONNECTED = 150
 VERIFY_MIN_CONNECTED = 300        # post-fix evidence before we call it resolved
 VERIFY_MAX_CONNECTED = 1000       # ... and the most we wait before deciding on the point estimate
