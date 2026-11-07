@@ -1,0 +1,4 @@
+## fallback — Linux 7.0.14-linuxkit x86_64, Python 3.10.22, nproc=8, mem=7934 MB
+system python3: venv module broken (as on Ubuntu without python3-venv)
+system python3: no httpx
+fallback: run.sh exit 0; finished: 1; .venv created: no; deps installed with --user: True
