@@ -31,7 +31,7 @@ if [ "$MODE" = grader ]; then
     log "$sc: run.sh exit $RC in $(( $(date +%s) - T0 ))s; exceptions in log: $(grep -ciE 'traceback|exception' "$OUT/controller_$sc.log")"
     kill $SIM; wait $SIM 2>/dev/null
     python3 -m sim grade --run runs/mine_$sc --baseline runs/base_$sc --out "$OUT/$sc.md" > /dev/null
-    if diff -q <(sed -n '5,200p' "$OUT/$sc.md") <(sed -n '5,200p' reports/$sc.md; echo) > /dev/null; then
+    if diff -q <(sed -n '5,200p' "$OUT/$sc.md") <(sed -n '5,200p' reports/$sc.md) > /dev/null; then
       log "$sc: grade report IDENTICAL to the committed reports/$sc.md (macOS)"
     else
       log "$sc: grade report differs from macOS — see $sc.md"; sed -n 5,10p "$OUT/$sc.md" | tee -a "$OUT/$MODE.txt"
