@@ -148,7 +148,9 @@ class IncidentResponder:
         last_closed = self.store.q1("SELECT MAX(closed_minute) FROM incidents WHERE wf=?", (wf,))
         start_min = max(m for m in (since, last_closed, 0) if m is not None)
         c = cusum(self.store, wf, pv, start_min // 60, ref)
-        fresh = since is not None and since >= 0 and now - since < settings.HALLUC_FRESH_HOURS * 60
+        # "fresh" = recently live AND without clean history here (a revert to a known-good prompt is not fresh)
+        fresh = since is not None and since >= 0 and now - since < settings.HALLUC_FRESH_HOURS * 60 and \
+            not any(p == pv for p, _ in known_good_prompts(self.store, wf, "", ref))
         h_alarm = settings.HALLUC_CUSUM_H_FRESH if fresh else settings.HALLUC_CUSUM_H
         if fresh:
             pre = self._prevalidate(ctx, pv, ref)

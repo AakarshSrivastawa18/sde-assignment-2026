@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from . import settings
 from .client import SimError
@@ -32,7 +33,25 @@ from .simtime import fmt
 
 log = logging.getLogger("controller.governance")
 
+
+def _fault(point: str):
+    """Fault injection for the crash test: CONTROLLER_CRASH_AFTER=submit|apply|auto kills the process right after
+    that HTTP call succeeded and BEFORE we record it — the worst moment. Fires once per marker file."""
+    if os.environ.get("CONTROLLER_CRASH_AFTER") == point:
+        marker = os.environ.get("CONTROLLER_CRASH_MARKER", "state/.crash_fired")
+        if not os.path.exists(marker):
+            open(marker, "w").write(point)
+            log.warning("fault injection: crashing right after %s", point)
+            os._exit(137)
+
 OPEN_APPROVAL = ("submitting", "pending", "approved", "applying")
+
+
+def canonical(cfg: dict) -> dict:
+    """Sorted keys at every level. The dialler samples options in the order a distribution lists them, so the
+    same weights in a different key order produce different calls; canonical configs make runs reproducible
+    (and a crashed run identical to an uninterrupted one)."""
+    return json.loads(json.dumps(cfg, sort_keys=True))
 
 
 class Governance:
@@ -127,7 +146,7 @@ class Governance:
             self.store.db.execute(
                 "INSERT INTO proposals(proposal_id,wf,kind,channel,status,base_version,config,request,items,"
                 "created_minute,updated_minute) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (pid, wf, kind, "approval", "submitting", ctx.version, json.dumps(config), json.dumps(request),
+                (pid, wf, kind, "approval", "submitting", ctx.version, json.dumps(canonical(config)), json.dumps(request),
                  json.dumps(items), now, now))
             self.store.decide(wf, "governance", "proposal_created", request["change_summary"],
                               {"kind": kind, "base_version": ctx.version, "items": items,
@@ -141,6 +160,7 @@ class Governance:
                 "proposed_config": p["config"], **p["request"]}
         try:
             r = self.client.request_approval(body)
+            _fault("submit")
         except SimError as e:
             if e.code == "duplicate_proposal_id":
                 return self._resolve_submitting(p)
@@ -236,6 +256,7 @@ class Governance:
             self._set(pid, status="applying")
         try:
             r = self.client.apply(wf, p["approval_id"])
+            _fault("apply")
         except SimError as e:
             if e.code == "stale_base_version":
                 st, why = "stale", "config changed since proposal (supervisor edit or another change); re-proposing"
@@ -270,7 +291,7 @@ class Governance:
             self.store.db.execute(
                 "INSERT INTO proposals(proposal_id,wf,kind,channel,status,base_version,config,request,items,"
                 "created_minute,updated_minute) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (pid, wf, kind, "auto", "auto_applying", ctx.version, json.dumps(config), json.dumps(req),
+                (pid, wf, kind, "auto", "auto_applying", ctx.version, json.dumps(canonical(config)), json.dumps(req),
                  json.dumps(items), now, now))
             self.store.decide(wf, "governance", "auto_apply_intent", req["change_summary"],
                               {"items": items, "base_version": ctx.version}, proposal_id=pid)
@@ -282,6 +303,7 @@ class Governance:
                 "rationale": p["request"]["rationale"], "evidence": p["request"].get("evidence") or {}}
         try:
             r = self.client.auto_apply(p["wf"], body)
+            _fault("auto")
         except SimError as e:
             if e.code == "duplicate_proposal_id":
                 return self._resolve_auto(p)

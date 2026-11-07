@@ -135,13 +135,14 @@ class Planner:
         return cfg
 
     # ------------------------------------------------------------------ act
-    def act(self, ctx: WorkflowCtx, now: int, urgent: bool = False):
+    def act(self, ctx: WorkflowCtx, now: int, urgent: bool = False) -> bool:
+        """Returns True once the desired state is live or a change carrying it has been sent (clears urgency)."""
         wf = ctx.id
         cur = ctx.config
         target = self.build(ctx, now)
         dims = changed_dims(cur, target)
         if not dims:
-            return
+            return True
         auto_ok = ctx.auto_dims() & {"schedule", "caller_id", "welcome_message", "voice"}
         approval_dims = [d for d in dims if d not in auto_ok]
         open_apr = self.gov.open_approval(wf)
@@ -150,28 +151,31 @@ class Planner:
             ok, why = self.gov.can_submit(wf, now, kind)
             if ok:
                 self._submit(ctx, now, kind, target, dims)
-                return
+                return True
             self._note_wait(wf, f"approval needed for {approval_dims}: {why}")
+        elif approval_dims and open_apr:
+            pass  # one open request per workflow; the next one carries this change
         # auto part: same cohorts as live, only auto-permitted dims moved
         if open_apr and not urgent:
-            return
+            return False
         auto_target = self._auto_target(ctx, now, auto_ok)
         adims = changed_dims(cur, auto_target)
         if not adims:
-            return
+            return not approval_dims
         last = self.store.kv(wf, "last_auto_minute", -10**9)
         if not urgent and now - last < settings.AUTO_STEP_COOLDOWN_MIN:
-            return
+            return False
         step = self._step(cur, auto_target, ctx.max_shift())
         sdims = changed_dims(cur, step)
         if not sdims:
-            return
+            return False
         items = self._items(ctx, cur, step, sdims, now)
         rationale = ". ".join(i["summary"] for i in items) or "policy-permitted operational change"
         evidence = {"items": [i.get("evidence") for i in items if i.get("evidence")]}
         with self.store.tx():
             self.store.set_kv(wf, "last_auto_minute", now)
         self.gov.auto_apply(wf, now, "incident" if urgent else "routine", step, rationale[:2000], evidence, items)
+        return not approval_dims and changed_dims(step, auto_target) == []
 
     def _auto_target(self, ctx, now, auto_ok: set[str]) -> dict:
         cur = ctx.config

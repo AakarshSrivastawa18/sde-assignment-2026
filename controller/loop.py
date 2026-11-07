@@ -40,7 +40,6 @@ class Controller:
         self.gov = Governance(self.store, self.client, self.ctxs)
         self.incidents = IncidentResponder(self.store, self.client, self.gov, self.ctxs)
         self.planner = Planner(self.store, self.client, self.gov, self.ctxs, self.codec)
-        self._pending_cfg_events: list[dict] = []
         self._tick_events = 0
         self._tick_ingest_s = 0.0
 
@@ -104,18 +103,23 @@ class Controller:
 
     # ------------------------------------------------------------------ events
     def _on_sim_event(self, ev: dict):
-        if ev["type"] == "config_changed":
-            self._pending_cfg_events.append(ev)
+        pass  # config_changed events are read back from `sim_events` (durable), not held in memory
 
     def _handle_config_events(self):
-        evs, self._pending_cfg_events = self._pending_cfg_events, []
-        for ev in evs:
+        """Handle config_changed events from the store with their own cursor, so a crash between ingesting an event
+        and reacting to it (e.g. pinning a supervisor's edit) cannot lose the reaction."""
+        done = self.store.meta("cfg_events_handled_upto", 0)
+        rows = self.store.q("SELECT event_id, body FROM sim_events WHERE type='config_changed' AND event_id>? "
+                            "ORDER BY event_id", (done,))
+        for eid, body in rows:
+            ev = json.loads(body)
             wf = ev["workflow_id"]
             ctx = self.ctxs.get(wf)
-            if not ctx:
-                continue
             m = ts_minute(ev["ts"])
             with self.store.tx():
+                self.store.set_meta("cfg_events_handled_upto", eid)
+                if not ctx:
+                    continue
                 self.store.db.execute(
                     "INSERT INTO config_versions(wf,version,actor,changed_dims,proposal_id,approval_id,applied_minute,"
                     "config) VALUES(?,?,?,?,?,?,?,NULL) ON CONFLICT(wf,version) DO UPDATE SET actor=excluded.actor, "
@@ -159,12 +163,14 @@ class Controller:
             self.ingestor.prune(now // MIN_PER_DAY)
 
     def _tick_wf(self, ctx: WorkflowCtx, now: int):
+        """Urgency is persisted with the transition that caused it (kv 'urgent') and cleared only after the
+        planner has acted, so a crash in between cannot downgrade an urgent change to a routine one."""
         wf = ctx.id
-        urgent = False
         with self.store.tx():
             d = callerid.step(ctx, self.store, now)
             self.store.set_kv(wf, "did_desired", d)
-            urgent |= d["urgent"]
+            if d["urgent"]:
+                self.store.set_kv(wf, "urgent", True)
             schedule.step(ctx, self.store, self.codec, now)
             guardrail.check(ctx, self.store, now)
         self.incidents.detect(wf, now)
@@ -176,13 +182,16 @@ class Controller:
             for dim in EXPERIMENT_DIMS:
                 if self.store.kv(wf, f"exp:{dim}") is None:
                     continue
+                r = None
                 if now >= 0 and mod == 0 and hod == look_h:
                     r = experiments.look(ctx, self.store, self.codec, dim, now)
-                    urgent |= r["urgent"]
                 elif now >= 0 and mod == 0 and lo + 2 <= hod <= hi and hod % 2 == 0:
                     r = experiments.look(ctx, self.store, self.codec, dim, now, intraday=True)
-                    urgent |= r["urgent"]
-        self.planner.act(ctx, now, urgent=urgent)
+                if r and r["urgent"]:
+                    self.store.set_kv(wf, "urgent", True)
+        if self.planner.act(ctx, now, urgent=bool(self.store.kv(wf, "urgent", False))):
+            with self.store.tx():
+                self.store.set_kv(wf, "urgent", False)
 
     # ------------------------------------------------------------------ run
     def run(self, kill_at_minute: int | None = None):

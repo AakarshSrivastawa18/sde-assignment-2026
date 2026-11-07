@@ -9,5 +9,6 @@ cd "$(dirname "$0")"
 PY="${PYTHON:-python3}"
 if [ -x .venv/bin/python ]; then PY=.venv/bin/python; fi
 "$PY" -c "import httpx" 2>/dev/null || "$PY" -m pip install -q -r requirements.txt
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"  # reproducible set ordering (configs are canonicalised too)
 export CONTROLLER_DB="${CONTROLLER_DB:-state/controller.db}"
 exec "$PY" -m controller run --url "$SIM_URL" --db "$CONTROLLER_DB"

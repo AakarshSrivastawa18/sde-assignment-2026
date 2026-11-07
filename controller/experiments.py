@@ -114,6 +114,11 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
     """Run tests, update arm statuses, promote/drop/rollback. Returns {'changed': bool, 'urgent': bool}."""
     wf = ctx.id
     st = store.kv(wf, f"exp:{dim}") or init_state(ctx, dim)
+    if st.get("last_look_minute") == now:
+        # idempotency: a look and its state changes commit together; re-running the same tick after a crash must
+        # not take a second step on the same data (it once turned a fresh segment split into a promotion)
+        return {"changed": False, "urgent": False}
+    st["last_look_minute"] = now
     start_h = st.setdefault("start_h", now // 60)
     data = ArmData(store, wf, dim, start_h)
     # a decaying arm hides behind its good early days in cumulative data: also judge the recent window
