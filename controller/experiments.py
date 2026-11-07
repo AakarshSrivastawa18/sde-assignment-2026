@@ -159,6 +159,16 @@ def look(ctx: WorkflowCtx, store, codec, dim: str, now: int, intraday: bool = Fa
                     continue
                 if intraday:
                     continue
+                if seg["arms"][a] == "ramped" and dr is not None and dr.n_arm >= settings.HARM_MIN_N and \
+                        dr.lift < settings.MIN_LIFT_TO_PROMOTE / 2:
+                    # symmetric to ramping: extra traffic only while the effect is visible in recent data
+                    seg["arms"][a] = "active"
+                    changed = True
+                    store.decide(wf, "experiment", "arm_deramped",
+                                 f"{label}: {a} no longer shows its effect (last 48h lift {dr.lift:+.1%}, n={dr.n_arm}; "
+                                 f"cumulative {d.lift:+.1%}) — back to {settings.EXPLORE_SHARE:.0%}",
+                                 {"dim": dim, "seg": key, "arm": a, "recent": dr.as_dict(), "cumulative": d.as_dict()})
+                    continue
                 if d.n_arm >= settings.FUTILITY_MIN_N and d.lift_ci(1.645)[1] < settings.MIN_LIFT_TO_PROMOTE:
                     seg["arms"][a] = "dropped"
                     changed = True
