@@ -77,6 +77,9 @@ class Store:
         self.db = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")  # a killed *process* never loses a committed txn in WAL
+        # checkpoint every ~80 MB of WAL instead of ~4 MB: each 15-min chunk touches pages all over the aggregate
+        # B-trees, and the default made nearly every commit a checkpoint (live ingest 13k → 45k events/s)
+        self.db.execute("PRAGMA wal_autocheckpoint=20000")
         self.db.execute("PRAGMA temp_store=MEMORY")
         self.db.execute("PRAGMA cache_size=-200000")
         self.db.executescript(SCHEMA)

@@ -85,8 +85,9 @@ class Ingestor:
         for ch in chunks:
             if ch["chunk"] <= self.cursor:
                 continue
-            text = self.client.chunk_text(ch["chunk"])
-            n, lm, sim_events = self._ingest_chunk(ch, text)
+            lines = self.client.chunk_lines(ch["chunk"]) if hasattr(self.client, "chunk_lines") else \
+                self.client.chunk_text(ch["chunk"]).splitlines()
+            n, lm, sim_events = self._ingest_chunk(ch, lines)
             n_events += n
             last_minute = lm if lm is not None else last_minute
             if on_sim_event:
@@ -95,7 +96,7 @@ class Ingestor:
         return {"events": n_events, "seconds": time.perf_counter() - t0, "chunks": len(chunks),
                 "last_minute": last_minute}
 
-    def _ingest_chunk(self, ch: dict, text: str):
+    def _ingest_chunk(self, ch: dict, lines):
         eng = defaultdict(lambda: [0, 0])
         pick = defaultdict(lambda: [0, 0])
         kpi = defaultdict(lambda: [0, 0, 0, 0])
@@ -106,7 +107,7 @@ class Ingestor:
         last_minute = None
         loads = json.loads
         with self.store.tx() as db:
-            for line in text.splitlines():
+            for line in (lines.splitlines() if isinstance(lines, str) else lines):
                 if not line:
                     continue
                 ev = loads(line)

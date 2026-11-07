@@ -73,6 +73,22 @@ class SimClient:
     def chunk_text(self, n: int) -> str:
         return self._req("GET", f"/events/chunks/{n}").text
 
+    def chunk_lines(self, n: int):
+        """Stream a chunk line by line (a history chunk is ~80 MB; never hold it as one string)."""
+        delay = 0.5
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                with self.http.stream("GET", f"/events/chunks/{n}") as r:
+                    if r.status_code >= 400:
+                        raise SimError(r.status_code, "chunk_fetch_failed", n)
+                    yield from r.iter_lines()
+                return
+            except httpx.TransportError:
+                if attempt == self.max_attempts:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 10.0)
+
     def approval(self, aid: str) -> dict:
         return self._req("GET", f"/approvals/{aid}").json()
 

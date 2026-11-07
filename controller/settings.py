@@ -41,8 +41,9 @@ DECAY_MIN_CTL = 300               # holdback calls in the window before judging:
 STABILITY_MIN_N = 50              # per daily window, for the "effect still present in each of the last 2 days" check
 
 # ---- caller IDs -------------------------------------------------------------------------------
-DID_EXPLORE_SHARE = 0.08          # untested number gets 8%: a spam-flagged one costs ≤~1.5% pickup
-DID_MAX_UNKNOWN_AT_ONCE = 2
+DID_EXPLORE_SHARE = 0.04          # an untested number gets 4%: if it is spam-flagged (health ~0.55 vs ~0.95) the
+DID_MAX_UNKNOWN_AT_ONCE = 2       # workflow loses ≈ 0.04×0.4 ≈ 1.7% pickup. 2×8% cost ~2.5% at load scale in testing;
+                                  # 1×4% made verdicts so slow that nw_kyc (one number, next_campaign_only) lost its lift.
 DID_MIN_EXPECTED_PICKUPS = 30     # population, not anecdote: ≥30 expected connects before judging
 DID_BAD_RATIO = 0.75              # observed/expected pickup ≤ 0.75 ...
 DID_BAD_Z = -3.0                  # ... and significant at p≈0.001
