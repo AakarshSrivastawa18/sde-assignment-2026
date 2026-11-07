@@ -355,6 +355,9 @@ moves to cheap partitioned storage.
 - **Result:** 8 restarts, 3 intents reconciled, **0 double-applies, 0 lost approvals, 0 status mismatches,
   245,008 call events = 245,008 aggregated dials**, and the controller-made config history is **identical** to an
   uninterrupted run (version, actor, dims, minute) ([reports/crash_test.md](reports/crash_test.md)).
+- **Linux:** the same checks inside `python:3.10-slim` capped at 4 CPUs / 7 GB (linux/aarch64; x86_64 not run):
+  public_01/02 grade reports byte-identical to macOS, crash test PASS with identical decisions, and `run.sh` starts
+  on a python3 with no venv module and no dependencies ([reports/linux_check.md](reports/linux_check.md)).
 - **Bugs this test found and fixed:** unhandled `config_changed` events in memory; urgency kept in memory; a re-run
   look taking a second step on the same data; non-canonical config key order making runs irreproducible (the
   dialler samples options in listed order).

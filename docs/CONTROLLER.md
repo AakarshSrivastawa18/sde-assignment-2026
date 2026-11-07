@@ -16,6 +16,8 @@ scripts/run_scenario.sh scenarios/public_01_dev.yaml 8701
 scripts/eval_all.sh scenarios/public_01_dev.yaml scenarios/public_02_incidents.yaml   # parallel, one line each
 scripts/crash_test.sh scenarios/public_02_incidents.yaml 5 8790                      # → reports/crash_test.md
 scripts/load_test.sh                                                                  # → reports/load_test.md
+git archive HEAD | docker run --rm -i --cpus 4 --memory 7g -v "$PWD/reports/linux:/out" python:3.10-slim \
+  bash -c 'mkdir /work && cd /work && tar -x && bash scripts/linux_check.sh grader'          # Linux, → reports/linux/
 .venv/bin/python -m pytest -q tests                                                   # 21 tests, ~3 s
 ```
 
