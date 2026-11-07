@@ -19,8 +19,8 @@
   off within 15 min of the verdict. Supervisor's bad prompt fixed through approval with validation evidence:
   **MTTR 180 min**, 6 credits.
 - Robustness: across public_01/02 plus 4 seed variants, **1 harmful change in 6 runs**
-  ([reports/robustness.md](reports/robustness.md)). Load: **30s controller time per simulated day** at public_03
-  volume, 31k events/s live, 407 MB RSS ([reports/load_test.md](reports/load_test.md)). Crash test: 8 kills
+  ([reports/robustness.md](reports/robustness.md)). Load: **30–35s controller time per simulated day** at public_03
+  volume, 25–31k events/s live, 410 MB RSS ([reports/load_test.md](reports/load_test.md)). Crash test: 8 kills
   (3 injected at the worst moment), **decisions identical to an uninterrupted run** ([reports/crash_test.md](reports/crash_test.md)).
 - **Cut:** per-person call time, cross-tenant fairness (C15), a UI (the supervisor view is a CLI), a weekly
   compliance digest, proactive prompt improvement.
@@ -126,17 +126,18 @@ engagement. I cut what has no effect at this scale (C15), and what Product wants
   else is a **ticket**, and each message says what to look at. Loop health without logs: `controller health`.
 - **No new stateful infra:** SQLite is a library and a file. Nobody operates it at 2 a.m. Backup is a file copy.
   In production the same schema moves to the Postgres you already run (§8).
-- **Numbers:** one simulated day of public_03 volume costs **30s of controller time** (about 52s wall including the
+- **Numbers:** one simulated day of public_03 volume costs **30–35s of controller time** (about 60s wall including the
   simulator), against your 10-minute budget. Where it breaks at 10×: §8.
 - **Reply:** *"Kabir, the kill test is in the repo: scripts/crash_test.sh kills the controller 8 times, including right
   after the simulator accepted a change we hadn't recorded yet. Result: no double applies, no lost approvals, the same
-  decisions as a clean run. No new infra; state is one SQLite file, Postgres in prod. One load-scale day takes 30s
-  of controller time (~52s wall), so ~11× headroom on your 10-minute budget. `controller health` shows lag, decisions
+  decisions as a clean run. No new infra; state is one SQLite file, Postgres in prod. One load-scale day takes ~35s
+  of controller time (~60s wall), so ~10× headroom on your 10-minute budget. `controller health` shows lag, decisions
   per hour and credits. Pages are only for things that need a human now."*
 
 ### 04 — Client Ops Supervisor (Anita, Kestrel)
-- **Accepted:** your edits are facts. A supervisor `config_changed` pins the edited dims for 24h; routine proposals
-  carry your values and say so. Experiments re-base on your choice as the new control. Requests: ≤2 routine per day,
+- **Accepted:** your edits are facts. A supervisor `config_changed` pins the edited dims for 24h; after that they
+  change only through an approval (never auto-applied, even where your policy would allow it), and the request says
+  it touches a dim you edited. Experiments re-base on your choice as the new control. Requests: ≤2 routine per day,
   never before 11:00 (stricter than your policy's 4/day from 10:00), batched into one request. One screen:
   `controller view --workflow ks_cancel` shows what's tested, what's winning, what we need from you, what changed
   today. The "compliance script word for word" failure: our first version did exactly that in testing (a false
@@ -286,7 +287,8 @@ auto:      auto_applying ─▶ applied | failed (403 reasons recorded)
   differs between live and proposed configs. Dry run = replay of the last 7 days of connected calls through the
   proposed cohorts, priced with measured arm lifts and pickup tables (point estimates; unmeasured options count 0).
   The schedule part is an IPF replay holding hour capacity and cohort volume fixed. Honest but uncalibrated.
-- **Supervisor edits mid-experiment.** Edited dims are pinned 24h. The experiment re-bases (the supervisor's choice
+- **Supervisor edits mid-experiment.** Edited dims are pinned 24h, and are approval-only for the rest of the run
+  (never auto-applied over a supervisor, even where policy permits auto-apply). The experiment re-bases (the supervisor's choice
   becomes the control; harm-dropped arms stay dropped). Open approvals on the old version fail on apply (`stale`) and
   are rebuilt on the new base. public_02: the supervisor set voice V2 at D5 15:00. The voice experiment re-based,
   resumed after 24h, and later dropped V4/V1 against V2 on evidence.
@@ -328,14 +330,14 @@ disk of the machine used. Per-day figures are unaffected.
 
 | | |
 |---|---|
-| live ingest | **31k events/s** (history backfill 113k/s: bigger chunks) |
-| controller time per simulated day | **30s** (ingest 25–30s, decide 2–3s) → wall incl. simulator ≈52s/day |
+| live ingest | **25–31k events/s** across runs (history backfill ~115k/s: bigger chunks) |
+| controller time per simulated day | **30–35s** across runs (ingest 25–33s, decide 2–3s) → wall incl. simulator ≈52–60s/day |
 | decision lag | 0 sim-min: every tick ingests to the head before deciding |
 | worst decide tick | 0.42s for 12 workflows |
-| peak RSS / state | 407 MB / 249 MB per 2 days (slim call log ≈ 200k rows/day) |
+| peak RSS / state | 410 MB / 249 MB per 2 days (slim call log ≈ 200k rows/day) |
 | hidden-truth verdicts | 50 changes: 32 beneficial, 18 neutral, 0 harmful |
 
-**What breaks first at 10×** (8.5M events/day, ~120 workflows): (1) **single-writer ingest**: 25–30s/day becomes
+**What breaks first at 10×** (8.5M events/day, ~120 workflows): (1) **single-writer ingest**: 25–33s/day becomes
 ~5 min/day; still inside a 12h window but no longer 15-min fresh during peaks (~600k events/h). (2) The **decide
 loop is linear in workflows** (~35 ms each per tick): 4s per tick at 120. (3) **SQLite file size** (~1.2 GB/day with
 the call log). (4) The in-memory lead join (~8M live leads ≈ 1.5 GB). **Partitioning:** shard by `workflow_id`. Every

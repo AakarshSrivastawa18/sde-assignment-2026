@@ -4,14 +4,14 @@
 
 ```
 # kill log
-kill 1: SIGKILL after 7.1s wall, world at 2027-01-05T13:30:00+05:30
-kill 2: SIGKILL after 2.94s wall, world at 2027-01-06T05:45:00+05:30
-kill 3: SIGKILL after 2.48s wall, world at 2027-01-06T14:45:00+05:30
-kill 4: SIGKILL after 4.07s wall, world at 2027-01-07T12:00:00+05:30
-kill 5: SIGKILL after 8.43s wall, world at 2027-01-09T12:00:00+05:30
-injected crash right after a successful 'auto' call (exit 137), world at 2027-01-10T10:00:00+05:30
-injected crash right after a successful 'submit' call (exit 137), world at 2027-01-11T18:00:00+05:30
-injected crash right after a successful 'apply' call (exit 137), world at 2027-01-11T19:15:00+05:30
+kill 1: SIGKILL after 2.9s wall, world at 2027-01-04T09:15:00+05:30
+kill 2: SIGKILL after 4.53s wall, world at 2027-01-05T10:45:00+05:30
+kill 3: SIGKILL after 7.57s wall, world at 2027-01-07T06:30:00+05:30
+kill 4: SIGKILL after 3.47s wall, world at 2027-01-07T19:45:00+05:30
+kill 5: SIGKILL after 3.75s wall, world at 2027-01-08T16:15:00+05:30
+injected crash right after a successful 'auto' call (exit 137), world at 2027-01-09T10:00:00+05:30
+injected crash right after a successful 'submit' call (exit 137), world at 2027-01-09T11:00:00+05:30
+injected crash right after a successful 'apply' call (exit 137), world at 2027-01-09T12:15:00+05:30
 final run exit code: 0
 ```
 
